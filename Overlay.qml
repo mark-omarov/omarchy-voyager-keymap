@@ -14,6 +14,8 @@ Item {
   property var shell: null
   property var manifest: null
   property bool opened: false
+  readonly property bool screensaverOn: ToplevelManager.toplevels.values.some(function(t) { return t.appId === "org.omarchy.screensaver" })
+  onScreensaverOnChanged: if (root.screensaverOn && root.practice) Quickshell.execDetached([root.helper, "practice", "off"])
 
   property var settings: ({})
   readonly property string layoutRef: typeof root.settings.layout === "string" ? root.settings.layout : ""
@@ -314,7 +316,7 @@ Item {
 
   OverlayWindow {
     id: window
-    shown: root.opened
+    shown: root.opened && !root.screensaverOn
     shownKeyboardFocus: WlrKeyboardFocus.None
     WlrLayershell.namespace: "voyager-keymap"
     mask: Region { item: card }
