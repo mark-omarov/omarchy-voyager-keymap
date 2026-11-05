@@ -6,17 +6,28 @@
       when --layout is given, else from Keymapp's local cache. Prints one JSON
       status line.
 
+  voyager-keymap practice on [--exit-key K] [--close-key K] [--move-key K] | off
+      Turns practice mode on or off: a Hyprland submap whose catchall bind
+      swallows every key, so nothing reaches apps or shortcuts while the
+      overlay keeps showing presses. Inside it, the exit key leaves practice,
+      the close key hides the overlay and the move key moves it.
+
   voyager-keymap watch
-      Prints a JSON line each time Keymapp reports a different keyboard state or
-      active layer. Needs Keymapp running with its API enabled; runs grpcio
-      through uv.
+      Reads the Voyager's raw HID channel and prints a JSON line for each layer
+      change and each key press or release, as the key's position in the layout.
+      When Keymapp is not running, it asks the keyboard to send these events
+      itself and asks it to stop again on exit.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import select
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -26,6 +37,10 @@ from pathlib import Path
 HOME = Path.home()
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "voyager-keymap"
 CACHE = STATE_DIR / "layout.json"
+CATALOG = STATE_DIR / "catalog.json"
+CATALOG_URL = "https://configure.zsa.io/metadata.json?release=latest"
+CATALOG_MAX_AGE = 7 * 24 * 3600
+USER_AGENT = "voyager-keymap (Omarchy plugin)"
 KEYMAPP_DIR = HOME / ".config" / ".keymapp"
 KEYMAPP_DB = KEYMAPP_DIR / "keymapp.sqlite3"
 KEYMAPP_SOCKET = KEYMAPP_DIR / "keymapp.sock"
@@ -34,7 +49,7 @@ ORYX_QUERY = (
     "query getLayout($hashId: String!, $revisionId: String!, $geometry: String) {"
     " layout(hashId: $hashId, geometry: $geometry, revisionId: $revisionId) {"
     " hashId title geometry revision { hashId createdAt title"
-    " layers { title position color keys } } } }"
+    " layers { title position color keys } combos { keyIndices layerIdx name trigger } } } }"
 )
 MAX_LABEL = 24
 KEY_COUNT = 52
@@ -89,25 +104,47 @@ LABELS = {
     "KC_TRANSPARENT": "", "KC_TRNS": "",
 }
 
-LAYER_VERBS = {"MO": "", "LT": "", "TO": "→ ", "TG": "⇄ ", "TT": "⇄ ", "OSL": "1× ", "DF": "Base "}
+LAYER_VERBS = {"MO": "", "LT": "", "LM": "", "TO": "to ", "TG": "toggle ", "TT": "toggle ", "OSL": "once ", "DF": "base "}
+MOMENTARY_LAYER_CODES = ("MO", "LM")
+MODIFIER_CODES = {
+    "KC_LEFT_CTRL", "KC_LCTL", "KC_LCTRL", "KC_RIGHT_CTRL", "KC_RCTL", "KC_RCTRL",
+    "KC_LEFT_SHIFT", "KC_LSFT", "KC_LSHIFT", "KC_RIGHT_SHIFT", "KC_RSFT", "KC_RSHIFT",
+    "KC_LEFT_ALT", "KC_LALT", "KC_RIGHT_ALT", "KC_RALT", "KC_LEFT_GUI", "KC_LGUI",
+    "KC_RIGHT_GUI", "KC_RGUI", "HYPR", "MEH", "OSM",
+}
+LAYER_ACTIONS = {
+    "MO": "Hold for", "LT": "Hold for", "LM": "Hold for", "TO": "Switch to", "TG": "Toggle",
+    "TT": "Hold for, tap to toggle", "OSL": "Next key on", "DF": "Make base",
+}
 
 MODIFIERS = (
     ("leftCtrl", "Ctrl"), ("rightCtrl", "Ctrl"), ("leftShift", "Shift"), ("rightShift", "Shift"),
     ("leftAlt", "Alt"), ("rightAlt", "AltGr"), ("leftGui", "Super"), ("rightGui", "Super"),
 )
+MODIFIER_NAMES = dict(MODIFIERS)
+
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+EMPTY_CODES = ("KC_TRANSPARENT", "KC_TRNS", "KC_NO")
+MAX_DETAIL = 160
 
 
-def clip(text):
+def color(value):
+    return value if isinstance(value, str) and HEX_COLOR.fullmatch(value) else None
+
+
+def clip(text, limit=MAX_LABEL):
     text = " ".join(str(text or "").split())
-    return text if len(text) <= MAX_LABEL else text[: MAX_LABEL - 1] + "…"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def code_label(code):
+def code_label(code, catalog=None):
     if code in LABELS:
         return LABELS[code]
     match = re.fullmatch(r"KC_([A-Z0-9])", code) or re.fullmatch(r"KC_(F\d{1,2})", code)
     if match:
         return match.group(1)
+    if catalog and catalog.get(code):
+        return catalog[code]
     match = re.fullmatch(r"KC_KP_(\w+)", code)
     if match:
         return "Num " + match.group(1).replace("_", " ").title()
@@ -121,64 +158,158 @@ def layer_title(layers, index):
     return f"Layer {index}"
 
 
-def slot_label(slot, layers):
+def held_modifiers(modifiers):
+    if isinstance(modifiers, str):
+        modifiers = {modifiers: True}
+    if not isinstance(modifiers, dict):
+        return []
+    return list(dict.fromkeys(name for key, name in MODIFIERS if modifiers.get(key) is True))
+
+
+def macro_text(macro, catalog):
+    parts = []
+    for step in (macro or {}).get("keys") or []:
+        code = (step or {}).get("code")
+        if not code or code in EMPTY_CODES:
+            continue
+        label = code_label(str(code), catalog)
+        held = held_modifiers(step.get("modifiers"))
+        parts.append("+".join(held + [label]) if held else label)
+    if all(len(part) == 1 for part in parts):
+        return "".join(parts)
+    return " ".join(parts)
+
+
+def slot_text(slot, layers, catalog=None):
+    """Short label for the keycap, the layer it points at, and a longer description."""
     if not isinstance(slot, dict) or not slot.get("code"):
-        return "", None
+        return "", None, ""
     code = str(slot["code"])
     layer = slot.get("layer")
-    if isinstance(layer, int):
-        return clip(LAYER_VERBS.get(code, code + " ") + layer_title(layers, layer)), layer
     if slot.get("macro"):
-        return clip(slot.get("description") or "Macro"), None
-    label = code_label(code)
-    modifiers = slot.get("modifiers") or {}
-    held = [name for key, name in MODIFIERS if modifiers.get(key) is True]
-    held = list(dict.fromkeys(held))
+        sequence = macro_text(slot["macro"], catalog)
+        return clip(slot.get("description") or sequence or "Macro"), None, clip("Types " + sequence, MAX_DETAIL)
+    if isinstance(layer, int):
+        title = layer_title(layers, layer)
+        held = held_modifiers(slot.get("modifier") or slot.get("modifiers"))
+        extra = " with " + "+".join(held) if held else ""
+        label = LAYER_VERBS.get(code, code + " ") + title
+        return clip(label), layer, clip(f"{LAYER_ACTIONS.get(code, code)} {title}{extra}", MAX_DETAIL)
+    if code == "OSM":
+        held = held_modifiers(slot.get("modifier") or slot.get("modifiers"))
+        name = "+".join(held) or "modifier"
+        return clip("1× " + name), None, clip(f"One-shot {name} for the next key", MAX_DETAIL)
+    label = code_label(code, catalog)
+    full = (catalog or {}).get(code) or label
+    held = held_modifiers(slot.get("modifiers"))
     if held and label:
         label = "+".join(held + [label])
-    return clip(label), None
+        full = "+".join(held + [full])
+    return clip(label), None, clip(full, MAX_DETAIL)
 
 
-def normalize(layout, source):
+def blank_key():
+    return {"kind": "regular", "swatch": None, "tap": "", "hold": "", "double": "", "tapHold": "", "layer": None,
+            "layerColor": None, "glow": None, "transparent": False, "none": True, "macro": False,
+            "details": []}
+
+
+def normalize(layout, source, catalog=None):
     revision = layout.get("revision") or {}
     raw_layers = (revision.get("layers") or [])[:MAX_LAYERS]
     raw_layers = sorted(raw_layers, key=lambda layer: layer.get("position", 0))
+    layer_colors = [color(raw.get("color")) for raw in raw_layers]
     layers = []
     for index, raw in enumerate(raw_layers):
         keys = []
         for raw_key in (raw.get("keys") or [])[:KEY_COUNT]:
             raw_key = raw_key if isinstance(raw_key, dict) else {}
-            tap, tap_layer = slot_label(raw_key.get("tap"), raw_layers)
-            hold, hold_layer = slot_label(raw_key.get("hold"), raw_layers)
-            double, _ = slot_label(raw_key.get("doubleTap"), raw_layers)
-            tap_hold, _ = slot_label(raw_key.get("tapHold"), raw_layers)
+            tap_slot = raw_key.get("tap") or {}
+            tap, tap_layer, tap_detail = slot_text(tap_slot, raw_layers, catalog)
+            hold, hold_layer, hold_detail = slot_text(raw_key.get("hold"), raw_layers, catalog)
+            double, _, double_detail = slot_text(raw_key.get("doubleTap"), raw_layers, catalog)
+            tap_hold, _, tap_hold_detail = slot_text(raw_key.get("tapHold"), raw_layers, catalog)
             custom = raw_key.get("customLabel") or raw_key.get("emoji")
             if isinstance(custom, str) and custom.strip():
                 tap = clip(custom)
-            tap_code = (raw_key.get("tap") or {}).get("code")
-            swatch = (raw_key.get("tap") or {}).get("color") if tap_code == "RGB" else None
+            tap_code = tap_slot.get("code")
+            has_macro = bool(tap_slot.get("macro"))
+            if tap_code in MOMENTARY_LAYER_CODES and tap_layer is not None and not hold:
+                hold, hold_layer, tap, tap_layer = layer_title(raw_layers, tap_layer), tap_layer, "", None
+            elif tap_code == "TT" and tap_layer is not None and not hold:
+                tap, hold, hold_layer = layer_title(raw_layers, tap_layer), "toggle", tap_layer
+            target = tap_layer if tap_layer is not None else hold_layer
+            glow = color(raw_key.get("glowColor"))
+            if raw_key.get("glowColor") is None:
+                glow = layer_colors[index]
+            details = [[name, text] for name, text in (
+                ("Tap", tap_detail), ("Hold", hold_detail), ("Tap twice", double_detail),
+                ("Tap, then hold", tap_hold_detail),
+            ) if text]
+            about = raw_key.get("about")
+            if isinstance(about, str) and about.strip():
+                details.append(["About", clip(about, MAX_DETAIL)])
+            if isinstance(raw_key.get("tappingTerm"), int):
+                details.append(["Tapping term", f"{raw_key['tappingTerm']} ms"])
+            if tap_layer is not None or hold_layer is not None:
+                kind = "layer"
+            elif has_macro:
+                kind = "macro"
+            elif double or tap_hold:
+                kind = "tapdance"
+            elif hold:
+                kind = "multi"
+            elif str(tap_code or "").startswith(("RGB", "TOGGLE_LAYER_COLOR", "LED_")):
+                kind = "led"
+            elif tap_code in MODIFIER_CODES:
+                kind = "modifier"
+            else:
+                kind = "regular"
             keys.append({
-                "swatch": swatch if isinstance(swatch, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", swatch) else None,
+                "kind": kind,
+                "swatch": color(tap_slot.get("color")) if tap_code == "RGB" else None,
                 "tap": tap,
                 "hold": hold,
                 "double": double,
                 "tapHold": tap_hold,
-                "layer": tap_layer if tap_layer is not None else hold_layer,
-                "transparent": tap_code in ("KC_TRANSPARENT", "KC_TRNS") and not hold,
+                "layer": target,
+                "layerColor": layer_colors[target] if isinstance(target, int) and 0 <= target < len(layer_colors) else None,
+                "glow": None if glow and glow.lower() == "#000000" else glow,
+                "transparent": (tap_code in ("KC_TRANSPARENT", "KC_TRNS") or (not tap_code and index > 0))
+                               and not (hold or double or tap_hold or has_macro),
+                "none": (tap_code == "KC_NO" or (not tap_code and index == 0))
+                        and not (hold or double or tap_hold or has_macro),
+                "macro": has_macro,
+                "details": details,
             })
-        keys += [{"swatch": None, "tap": "", "hold": "", "double": "", "tapHold": "", "layer": None, "transparent": False}
-                 for _ in range(KEY_COUNT - len(keys))]
-        color = raw.get("color")
+        keys += [blank_key() for _ in range(KEY_COUNT - len(keys))]
         layers.append({
             "title": clip(raw.get("title") or f"Layer {index}"),
-            "color": color if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color) else None,
+            "color": layer_colors[index],
             "keys": keys,
         })
     base = layers[0]["keys"] if layers else []
     for layer in layers[1:]:
         for i, key in enumerate(layer["keys"]):
             if key["transparent"]:
-                key["through"] = base[i]["tap"]
+                for field in ("kind", "tap", "hold", "double", "tapHold", "layer", "layerColor", "swatch", "none", "macro", "details"):
+                    key[field] = base[i][field]
+                key["through"] = True
+    combos = []
+    for raw in (revision.get("combos") or [])[:64]:
+        raw = raw if isinstance(raw, dict) else {}
+        indices = [i for i in raw.get("keyIndices") or [] if isinstance(i, int) and 0 <= i < KEY_COUNT]
+        layer_index = raw.get("layerIdx")
+        if len(indices) < 2 or not isinstance(layer_index, int):
+            continue
+        trigger = raw.get("trigger") or {}
+        label, _, detail = slot_text(trigger.get("tap"), raw_layers, catalog)
+        combos.append({
+            "keys": indices,
+            "layer": layer_index,
+            "label": clip(raw.get("name") or label),
+            "detail": clip(detail or raw.get("name") or "", MAX_DETAIL),
+        })
     return {
         "title": clip(layout.get("title") or "Voyager layout"),
         "layoutId": str(layout.get("hashId") or ""),
@@ -187,6 +318,7 @@ def normalize(layout, source):
         "source": source,
         "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "layers": layers,
+        "combos": combos,
     }
 
 
@@ -203,22 +335,22 @@ def parse_layout_ref(ref):
     return layout_id, revision
 
 
-def from_oryx(ref):
+def from_oryx(ref, catalog=None):
     layout_id, revision = parse_layout_ref(ref)
     body = json.dumps({
         "query": ORYX_QUERY,
         "variables": {"hashId": layout_id, "geometry": "voyager", "revisionId": revision},
     }).encode()
-    request = urllib.request.Request(ORYX_API, data=body, headers={"content-type": "application/json"})
+    request = urllib.request.Request(ORYX_API, data=body, headers={"content-type": "application/json", "user-agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=15) as response:
         payload = json.loads(response.read(8 * 1024 * 1024))
     layout = (payload.get("data") or {}).get("layout")
     if not layout:
         raise RuntimeError(f"Oryx has no Voyager layout {layout_id}")
-    return normalize(layout, "oryx")
+    return normalize(layout, "oryx", catalog)
 
 
-def from_keymapp(db_path=KEYMAPP_DB):
+def from_keymapp(db_path=KEYMAPP_DB, catalog=None):
     if not db_path.exists():
         raise RuntimeError("no layout set and no Keymapp cache yet")
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
@@ -231,7 +363,7 @@ def from_keymapp(db_path=KEYMAPP_DB):
     if not layouts:
         raise RuntimeError("Keymapp has not cached a Voyager layout yet")
     newest = max(layouts, key=lambda layout: (layout.get("revision") or {}).get("createdAt") or "")
-    return normalize(newest, "keymapp")
+    return normalize(newest, "keymapp", catalog)
 
 
 def write_cache(model):
@@ -241,9 +373,45 @@ def write_cache(model):
     tmp.replace(CACHE)
 
 
-def cmd_fetch(args):
+def build_catalog(metadata):
+    catalog = {}
+    for entry in (metadata or {}).get("keys") or []:
+        if not isinstance(entry, dict) or entry.get("deleted"):
+            continue
+        code, label = entry.get("code"), entry.get("label")
+        if isinstance(code, str) and isinstance(label, str) and label.strip() and code not in catalog:
+            catalog[code] = clip(label)
+    return catalog
+
+
+def load_catalog():
     try:
-        model = from_oryx(args.layout) if args.layout else from_keymapp()
+        fresh = time.time() - CATALOG.stat().st_mtime < CATALOG_MAX_AGE
+    except OSError:
+        fresh = False
+    if not fresh:
+        try:
+            request = urllib.request.Request(CATALOG_URL, headers={"user-agent": USER_AGENT})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                catalog = build_catalog(json.loads(response.read(16 * 1024 * 1024)))
+            if catalog:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = CATALOG.with_suffix(".tmp")
+                tmp.write_text(json.dumps(catalog, ensure_ascii=False))
+                tmp.replace(CATALOG)
+                return catalog
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+    try:
+        return json.loads(CATALOG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_fetch(args):
+    catalog = load_catalog()
+    try:
+        model = from_oryx(args.layout, catalog) if args.layout else from_keymapp(catalog=catalog)
     except (OSError, ValueError, RuntimeError, urllib.error.URLError, sqlite3.Error, json.JSONDecodeError) as error:
         print(json.dumps({"ok": False, "error": str(error)}), flush=True)
         return 1
@@ -252,87 +420,163 @@ def cmd_fetch(args):
     return 0
 
 
-def read_varint(data, pos):
-    value = shift = 0
-    while True:
-        byte = data[pos]
-        pos += 1
-        value |= (byte & 0x7F) << shift
-        if not byte & 0x80:
-            return value, pos
-        shift += 7
+PRACTICE_PREFIX = "voyager-practice"
+PLUGIN_ID = "io.github.mark-omarov.voyager-keymap"
+KEY_SPEC = re.compile(r"[A-Z0-9_]+( \+ [A-Z0-9_]+)*")
 
 
-def decode_fields(data):
-    fields, pos = {}, 0
-    while pos < len(data):
-        tag, pos = read_varint(data, pos)
-        number, wire = tag >> 3, tag & 7
-        if wire == 0:
-            fields[number], pos = read_varint(data, pos)
-        elif wire == 2:
-            length, pos = read_varint(data, pos)
-            fields[number], pos = data[pos:pos + length], pos + length
-        elif wire == 5:
-            fields[number], pos = data[pos:pos + 4], pos + 4
-        elif wire == 1:
-            fields[number], pos = data[pos:pos + 8], pos + 8
-        else:
-            raise ValueError(f"unsupported wire type {wire}")
-    return fields
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=5).stdout
 
 
-def decode_status(reply):
-    keyboard = decode_fields(decode_fields(reply).get(2, b""))
-    return keyboard.get(1, b"").decode(errors="replace"), int(keyboard.get(3, 0))
+def key_spec(value):
+    spec = " ".join(str(value).upper().split())
+    if not KEY_SPEC.fullmatch(spec):
+        raise ValueError(f"not a Hyprland key: {value!r}")
+    return spec
+
+
+def practice_submap(exit_key, close_key, move_key):
+    name = PRACTICE_PREFIX + "-" + hashlib.sha1(f"{exit_key}|{close_key}|{move_key}".encode()).hexdigest()[:8]
+    move = f"omarchy-shell shell summon {PLUGIN_ID} '{{\\\"action\\\":\\\"move\\\"}}'"
+    lua = (f'hl.define_submap("{name}", function() '
+           f'hl.bind("{exit_key}", hl.dsp.submap("reset")) '
+           f'hl.bind("{close_key}", hl.dsp.exec_cmd("omarchy-shell shell hide {PLUGIN_ID}")) '
+           f'hl.bind("{move_key}", hl.dsp.exec_cmd("{move}")) '
+           'hl.bind("catchall", function() end) end)')
+    return name, lua
+
+
+def cmd_practice(args):
+    current = hyprctl("submap").strip()
+    if args.state == "off":
+        if current.startswith(PRACTICE_PREFIX):
+            hyprctl("dispatch", 'hl.dsp.submap("reset")')
+        print(json.dumps({"ok": True, "practice": False}), flush=True)
+        return 0
+    try:
+        name, lua = practice_submap(key_spec(args.exit_key), key_spec(args.close_key), key_spec(args.move_key))
+    except ValueError as error:
+        print(json.dumps({"ok": False, "error": str(error)}), flush=True)
+        return 1
+    try:
+        binds = json.loads(hyprctl("binds", "-j") or "[]")
+    except ValueError:
+        binds = []
+    if not any(bind.get("submap") == name for bind in binds):
+        hyprctl("eval", lua)
+    hyprctl("dispatch", f'hl.dsp.submap("{name}")')
+    active = hyprctl("submap").strip() == name
+    print(json.dumps({"ok": active, "practice": active}), flush=True)
+    return 0 if active else 1
+
+
+# Matrix (row, col) of each key, in Oryx key order (QMK zsa/voyager k00..k51).
+MATRIX = (
+    [(0, c) for c in range(1, 7)] + [(1, c) for c in range(1, 7)] + [(2, c) for c in range(1, 7)]
+    + [(3, 1), (3, 2), (3, 3), (3, 4), (3, 5), (4, 4)] + [(5, 0), (5, 1)]
+    + [(6, c) for c in range(0, 6)] + [(7, c) for c in range(0, 6)] + [(8, c) for c in range(0, 6)]
+    + [(10, 2), (9, 1), (9, 2), (9, 3), (9, 4), (9, 5)] + [(11, 5), (11, 6)]
+)
+POSITION = {rc: index for index, rc in enumerate(MATRIX)}
+ZSA_VENDOR = re.compile(r"^HID_ID=[0-9A-Fa-f]+:00003297:", re.M)
+RAW_HID_USAGE_PAGE = bytes([0x06, 0x60, 0xFF])
+EVT_LAYER, EVT_KEYDOWN, EVT_KEYUP = 5, 6, 7
+CMD_PAIRING_INIT, CMD_DISCONNECT = 1, 3
+
+
+def find_raw_hid(sys_root=Path("/sys/class/hidraw")):
+    for node in sorted(sys_root.glob("hidraw*")):
+        try:
+            uevent = (node / "device" / "uevent").read_text()
+            descriptor = (node / "device" / "report_descriptor").read_bytes()[:3]
+        except OSError:
+            continue
+        if ZSA_VENDOR.search(uevent) and descriptor == RAW_HID_USAGE_PAGE:
+            return Path("/dev") / node.name
+    return None
+
+
+def parse_report(data):
+    if len(data) >= 2 and data[0] == EVT_LAYER:
+        return {"layer": data[1]}
+    if len(data) >= 3 and data[0] in (EVT_KEYDOWN, EVT_KEYUP):
+        index = POSITION.get((data[2], data[1]))
+        if index is not None:
+            return {"key": index, "down": data[0] == EVT_KEYDOWN}
+    return None
+
+
+def send_command(fd, code):
+    os.write(fd, bytes([0, code]) + bytes(31))
 
 
 def cmd_watch(_args):
-    if os.environ.get("VOYAGER_KEYMAP_IN_UV") != "1":
-        os.environ["VOYAGER_KEYMAP_IN_UV"] = "1"
-        try:
-            os.execvp("uv", ["uv", "run", "--quiet", "--no-project", "--with", "grpcio==1.85.1",
-                             "python3", os.path.abspath(__file__), "watch"])
-        except OSError:
-            print(json.dumps({"state": "no-uv"}), flush=True)
-            return 1
-    import grpc
+    def emit(message):
+        print(json.dumps(message), flush=True)
 
-    def emit(state, layer=None, keyboard=""):
-        print(json.dumps({"state": state, "layer": layer, "keyboard": keyboard}), flush=True)
+    state = {"fd": None, "paired": False, "last": None}
 
-    last = None
-    channel = None
+    def set_state(name):
+        if name != state["last"]:
+            emit({"state": name, "layer": 0 if name in ("connected", "read-only") else None})
+            state["last"] = name
+
+    def release():
+        if state["fd"] is None:
+            return
+        if state["paired"]:
+            try:
+                send_command(state["fd"], CMD_DISCONNECT)
+            except OSError:
+                pass
+        os.close(state["fd"])
+        state.update(fd=None, paired=False)
+
+    def stop(*_):
+        release()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
     while True:
+        path = find_raw_hid()
+        if path is None:
+            set_state("no-keyboard")
+            time.sleep(1)
+            continue
+        writable = True
         try:
-            if not KEYMAPP_SOCKET.exists():
-                current = ("no-keymapp", None, "")
-            else:
-                if channel is None:
-                    channel = grpc.insecure_channel(f"unix://{KEYMAPP_SOCKET}")
-                identity = lambda value: value
-                status = channel.unary_unary("/api.KeyboardService/GetStatus",
-                                             request_serializer=lambda _: b"", response_deserializer=identity)
-                name, layer = decode_status(status(None, timeout=1.0))
-                if name:
-                    current = ("connected", layer, name)
-                else:
-                    connect = channel.unary_unary("/api.KeyboardService/ConnectAnyKeyboard",
-                                                  request_serializer=lambda _: b"", response_deserializer=identity)
-                    try:
-                        connect(None, timeout=1.0)
-                    except grpc.RpcError:
-                        pass
-                    current = ("no-keyboard", None, "")
-        except grpc.RpcError:
-            if channel is not None:
-                channel.close()
-            channel = None
-            current = ("no-keymapp", None, "")
-        if current != last:
-            emit(*current)
-            last = current
-        time.sleep(0.1 if current[0] == "connected" else 1.0)
+            fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            writable = False
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except PermissionError:
+                set_state("no-access")
+                time.sleep(2)
+                continue
+        except OSError:
+            time.sleep(1)
+            continue
+        state.update(fd=fd, paired=False)
+        try:
+            while True:
+                if writable and not state["paired"] and not KEYMAPP_SOCKET.exists():
+                    send_command(fd, CMD_PAIRING_INIT)
+                    state["paired"] = True
+                set_state("connected" if writable or KEYMAPP_SOCKET.exists() else "read-only")
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+                event = parse_report(os.read(fd, 64))
+                if event:
+                    emit(event)
+        except OSError:
+            state["paired"] = False
+            release()
+            time.sleep(1)
 
 
 def main():
@@ -341,8 +585,13 @@ def main():
     fetch = sub.add_parser("fetch")
     fetch.add_argument("--layout", default="")
     sub.add_parser("watch")
+    practice = sub.add_parser("practice")
+    practice.add_argument("state", choices=("on", "off"))
+    practice.add_argument("--exit-key", default="SUPER + SHIFT + ALT + K")
+    practice.add_argument("--close-key", default="SUPER + SHIFT + K")
+    practice.add_argument("--move-key", default="SUPER + SHIFT + CTRL + K")
     args = parser.parse_args()
-    return {"fetch": cmd_fetch, "watch": cmd_watch}[args.command](args)
+    return {"fetch": cmd_fetch, "watch": cmd_watch, "practice": cmd_practice}[args.command](args)
 
 
 if __name__ == "__main__":

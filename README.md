@@ -1,98 +1,109 @@
 # Voyager Keymap
 
-An on-screen map of your [ZSA Voyager](https://www.zsa.io/voyager) layout for [Omarchy](https://omarchy.org), toggled with one hotkey. It draws every layer from your [Oryx](https://configure.zsa.io) layout and, while Keymapp is running, highlights the layer the keyboard is on as you switch. A community plugin, not part of Omarchy itself.
+A live map of your [ZSA Voyager](https://www.zsa.io/voyager) layout for [Omarchy](https://omarchy.org), one hotkey away. It follows the layer you are on, lights up the keys you press, and colors every key the way its LED is lit, so a board with blank keycaps still matches what you see on screen. A practice mode lets you try keys and combos without anything reaching your apps. A community plugin, not part of Omarchy itself.
 
-It is for the weeks after you change your layout, when your fingers haven't caught up yet. The map never takes keyboard focus, so you keep typing while it is up.
+![The map on the Main layer](preview.png)
 
-![The Voyager default layout in the overlay](preview.png)
+![The map on the Sym layer](screenshots/sym.png)
 
-| Symbols and numbers | Board and system |
-| --- | --- |
-| ![Symbols and numbers layer](screenshots/symbols-numbers.png) | ![Board and system layer](screenshots/board-system.png) |
+## Reading the map
 
-Each key shows its tap action in the middle and its hold action underneath. Keys that switch layers are outlined in the theme accent and labeled with the target layer's name. Double-tap actions sit in the top corner, and keys a layer leaves see-through are dimmed, showing the base key that falls through. Colors follow the Omarchy theme.
+- The big label is what a tap does. The small text under it is what holding does.
+- Each key glows in the color its LED has on that layer, so you can find it on the board by color.
+- Keys that switch layers name the target layer in its color: `Sym` under Tab means hold Tab for Sym, `to Main` switches on a tap, `toggle` turns a layer on and off.
+- `2×` in the top corner is what a double tap does, `tap+hold` at the bottom is what a tap followed by a hold does.
+- `macro` marks a key that types a sequence; the label shows the sequence.
+- `combo` marks keys that do something else when pressed together. The middle of the map lists the combos on the current layer, for example `F + J → Ctrl+B`.
+- Faded keys are left unassigned on this layer and act as they do on the base layer. Empty keys do nothing.
+- Point at a key, or press it, and the middle of the map spells out everything it does.
 
-## Requirements
-
-- Omarchy 4 (the Quattro shell). This is a shell plugin, not a standalone app.
-- `python3`, which Omarchy already ships.
-- For the live layer only:
-  - [Keymapp](https://www.zsa.io/flash) 1.3.2 or newer, running, with its API turned on.
-  - [`uv`](https://docs.astral.sh/uv/). The live-layer watcher runs `grpcio` 1.85.1 through `uv run --with`, so nothing is installed into your system Python.
-
-Without Keymapp the map still works. It opens on the first layer, and you click a layer name to switch.
+The labels come from Oryx: every keycode Oryx offers, macros, one-shot modifiers, all layer key types, combos, custom labels and per-key tapping terms.
 
 ## Install
+
+Requires Omarchy 4 and `python3`, which Omarchy ships.
 
 ```bash
 omarchy plugin add https://github.com/mark-omarov/omarchy-voyager-keymap.git --enable
 ```
 
-Then add a hotkey to `~/.config/hypr/bindings.lua`:
+Add the hotkeys to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + SHIFT + K", "Voyager keymap", { panel = "io.github.mark-omarov.voyager-keymap" })
+o.bind("SUPER + SHIFT + ALT + K", "Voyager keymap practice", [[omarchy-shell shell summon io.github.mark-omarov.voyager-keymap '{"action":"practice"}']])
+o.bind("SUPER + SHIFT + CTRL + K", "Move Voyager keymap", [[omarchy-shell shell summon io.github.mark-omarov.voyager-keymap '{"action":"move"}']])
 ```
 
-`omarchy-shell shell toggle io.github.mark-omarov.voyager-keymap` does the same from a terminal or a script. To open on a particular layer, pass it, counting from 0:
+The map reads the keyboard over USB, which Linux allows only with ZSA's udev rules. Install them as described in [ZSA's Linux guide](https://github.com/zsa/wally/wiki/Linux-install); Keymapp needs the same rules. Their rules open every device the Voyager exposes, its typing devices included, to every program. Only the raw HID channel is needed, so this narrower rule is enough for both the map and Keymapp:
 
-```bash
-omarchy-shell shell toggle io.github.mark-omarov.voyager-keymap '{"layer": 2}'
+```
+KERNEL=="hidraw*", ATTRS{idVendor}=="3297", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="3297", TAG+="uaccess"
 ```
 
 ## Point it at your layout
 
-Open your layout in Oryx and copy its URL. Then add it to the plugin's entry in `~/.config/omarchy/shell.json`:
+Copy your layout's URL from Oryx and add it to the plugin's entry in `~/.config/omarchy/shell.json`:
 
 ```json
-"plugins": [
-  {
-    "id": "io.github.mark-omarov.voyager-keymap",
-    "layout": "https://configure.zsa.io/voyager/layouts/AbCdE/latest/0"
-  }
-]
+{ "id": "io.github.mark-omarov.voyager-keymap", "layout": "https://configure.zsa.io/voyager/layouts/AbCdE/latest/0" }
 ```
 
-The file reloads on save. No login is needed: the plugin reads layouts the way Oryx's share links do.
+Without `layout`, the map uses the newest Voyager layout in [Keymapp](https://www.zsa.io/flash)'s local cache, which holds the layout flashed on your keyboard once Keymapp has connected to it.
 
-Without `layout`, the plugin uses the newest Voyager layout in Keymapp's local cache instead. Keymapp downloads the layout that is flashed on your keyboard once the keyboard is connected, so that route needs no URL at all.
+The map re-reads the layout every time it opens, so edits in Oryx show up on the next open. `latest` means the newest saved revision, even one you have not flashed yet; put a revision id in its place to pin one. The layout id stays the same across revisions, so the URL only changes if you start a new layout.
 
-## Keeping up with layout changes
+## Use
 
-Every time the map opens, it re-reads the layout in the background and redraws once the read finishes. Edit in Oryx, open the map, and the change is there.
+| | Keyboard | Mouse |
+| --- | --- | --- |
+| Show or hide | Super+Shift+K | ✕ in the corner |
+| Practice on or off | Super+Shift+Alt+K | Practice in the corner |
+| Move | Super+Shift+Ctrl+K cycles through the corners and edges | Drag the map |
+| Resize | | Scroll over the map |
+| Look at another layer | | Click its name |
 
-- `latest` in the URL means the newest saved revision in Oryx, even one you haven't flashed yet, so the map can be ahead of the keyboard until you flash. To pin a revision, put its id from the Oryx URL in place of `latest`.
-- The layout id stays the same across revisions, so the URL only changes if you duplicate the layout or start a new one.
-- The last successful read is kept in `~/.local/state/voyager-keymap/layout.json`, so the map also works offline.
+The map never takes keyboard focus, so you keep typing while it is open. Position and size are remembered.
 
-## Live layer
+### Practice mode
+
+Practice mode swallows every key before it reaches an app or a shortcut, while the map keeps lighting up keys, following layers and explaining what you press. It is the way to try combos, macros and complex keys without side effects. It blocks every keyboard, not only the Voyager; the mouse keeps working.
+
+The practice hotkey always ends it, because Hyprland handles that key itself. The show/hide hotkey and closing the map end it too. Practice mode is a temporary Hyprland submap created at runtime; your Hyprland config is not changed.
+
+### Settings
+
+All optional, in the plugin's entry in `~/.config/omarchy/shell.json`:
+
+| Key | Default | |
+| --- | --- | --- |
+| `layout` | none | Oryx layout URL or id |
+| `toggleKey` | `SUPER + SHIFT + K` | Must match your show/hide binding, so it also works in practice mode |
+| `practiceKey` | `SUPER + SHIFT + ALT + K` | Ends practice mode |
+| `moveKey` | `SUPER + SHIFT + CTRL + K` | Moves the map in practice mode |
+
+## How it works
 
 ```mermaid
 flowchart LR
   oryx[Oryx<br/>oryx.zsa.io] -->|layout, on open| helper
-  cache[Keymapp cache<br/>keymapp.sqlite3] -->|layout, no URL set| helper
+  cache[Keymapp cache] -->|layout, no URL set| helper
+  zsa[ZSA keycode catalog] -->|labels, weekly| helper
   helper[voyager-keymap fetch] --> json[(layout.json)]
   json --> overlay[Overlay]
-  keymapp[Keymapp API<br/>keymapp.sock] -->|current layer, every 100 ms| watch[voyager-keymap watch]
+  board[Voyager raw HID] -->|layer changes, key presses| watch[voyager-keymap watch]
   watch --> overlay
 ```
 
-While the map is open, `voyager-keymap watch` asks Keymapp's [local API](https://github.com/zsa/kontroll) for the keyboard's current layer every 100 ms, and the highlighted tab follows it. The watcher stops when the map closes. To set it up:
-
-1. Install Keymapp and set up USB access by following [ZSA's Linux instructions](https://github.com/zsa/wally/wiki/Linux-install).
-2. In Keymapp, open the config page, turn on **API**, and restart Keymapp.
-3. Connect the keyboard.
-
-The top-right corner of the map shows the state: `Live: <keyboard>`, `Keymapp: no keyboard`, `Keymapp not running`, or `uv missing: no live layer`.
-
-Keymapp only answers while it is running. [Keymapp Layers](https://github.com/ethanthompson/omarchy-plugin-keymapp) documents a neat way to keep it running on a hidden special workspace, and pairs well with this plugin: it shows the active layer's name in the bar.
+While the map is open, `voyager-keymap watch` reads the keyboard's raw HID channel. The firmware reports each layer change and each key press as the key's position. When Keymapp is running it has already asked the keyboard for these reports and the map listens alongside; otherwise the map asks for them itself and asks the keyboard to stop when the map closes.
 
 ## What it touches
 
-- Reads `~/.config/omarchy/shell.json` for its own entry, and `~/.config/.keymapp/` (read-only) when Keymapp is installed.
-- Writes only `~/.local/state/voyager-keymap/layout.json`.
-- Network: `https://oryx.zsa.io/graphql` when the map opens and `layout` is set. On the first live-layer run, `uv` downloads `grpcio` from PyPI into its cache.
-- Needs no root access, runs no background services, and never edits your Hyprland config.
+- Reads its own entry in `~/.config/omarchy/shell.json`, Keymapp's cache in `~/.config/.keymapp/` (read-only), and the Voyager's raw HID channel while the map is open. Key positions are only drawn, never stored.
+- Writes `~/.local/state/voyager-keymap/`: the last layout, ZSA's keycode labels and the map's position.
+- Network: `oryx.zsa.io` each time the map opens with `layout` set, and `configure.zsa.io/metadata.json` (ZSA's keycode labels) at most once a week.
+- Needs no root access, runs no background services, and never edits your config.
 
 ## Remove
 
@@ -101,13 +112,14 @@ omarchy plugin remove io.github.mark-omarov.voyager-keymap
 rm -rf ~/.local/state/voyager-keymap
 ```
 
-Then delete the hotkey line from `~/.config/hypr/bindings.lua`.
+Then delete the three hotkey lines from `~/.config/hypr/bindings.lua`.
 
 ## Notes
 
-- `omarchy plugin disable` followed by `enable` recreates the plugin's entry and drops `layout`; add it back afterwards.
-- The plugin stays loaded between opens. After editing its QML, run `omarchy restart shell`.
+- `omarchy plugin disable` followed by `enable` recreates the plugin's entry without `layout`; add it back afterwards.
+- The plugin stays loaded between opens. After changing its QML, run `omarchy restart shell`.
 - Tests: `python3 -m unittest discover -s tests`.
+- [Keymapp Layers](https://github.com/ethanthompson/omarchy-plugin-keymapp) shows the active layer's name in the bar and pairs well with this map.
 
 ## License
 

@@ -39,17 +39,19 @@ class Labels(unittest.TestCase):
     def setUp(self):
         base = layer("Main", [
             key(slot("KC_EQUAL"), hold=slot("KC_ESCAPE")),
-            key(slot("KC_A"), hold=slot("KC_LEFT_SHIFT")),
+            key(slot("KC_A"), hold=slot("KC_LEFT_SHIFT"), glowColor="#23CC1D"),
             key(slot("KC_ENTER"), hold=slot("MO", layer=1)),
-            key(slot("KC_TAB", modifiers={"leftCtrl": True, "leftShift": True, "leftAlt": False})),
-            key(slot("TG", layer=1)),
+            key(slot("KC_TAB", modifiers={"leftCtrl": True, "leftShift": True, "leftAlt": False}), glowColor="#000000"),
+            key(slot("TG", layer=1), glowColor="javascript:alert(1)"),
             key(slot("KC_LBRC"), doubleTap=slot("KC_RBRC")),
             key(slot("RGB", color="#ff0000")),
             key(slot("KC_SCLN"), customLabel="<img src=https://example.invalid/x>"),
             key(slot("KC_F12")),
             key(slot("SOME_NEW_CODE")),
         ], 0)
+        base["color"] = "#6957d2"
         sym = layer("Sym", [key(slot("KC_TRANSPARENT")), key(slot("KC_EXLM"))], 1)
+        sym["color"] = "#0075FF"
         self.model = vk.normalize(oryx_layout([sym, base]), "oryx")
         self.main = self.model["layers"][0]["keys"]
         self.sym = self.model["layers"][1]["keys"]
@@ -60,10 +62,23 @@ class Labels(unittest.TestCase):
     def test_tap_and_hold(self):
         self.assertEqual((self.main[0]["tap"], self.main[0]["hold"]), ("=", "Esc"))
         self.assertEqual((self.main[1]["tap"], self.main[1]["hold"]), ("A", "Shift"))
+        self.assertEqual(self.main[1]["kind"], "multi")
 
     def test_layer_keys_use_layer_names(self):
         self.assertEqual((self.main[2]["hold"], self.main[2]["layer"]), ("Sym", 1))
-        self.assertEqual(self.main[4]["tap"], "⇄ Sym")
+        self.assertEqual(self.main[4]["tap"], "toggle Sym")
+
+    def test_kinds(self):
+        self.assertEqual([self.main[i]["kind"] for i in (0, 2, 4, 5, 6, 8)],
+                         ["multi", "layer", "layer", "tapdance", "led", "regular"])
+
+    def test_momentary_layer_on_tap_reads_as_hold(self):
+        cap = vk.normalize(oryx_layout([layer("Main", [key(slot("MO", layer=1))], 0), layer("Nav", [], 1)]), "oryx")["layers"][0]["keys"][0]
+        self.assertEqual((cap["tap"], cap["hold"], cap["layer"]), ("", "Nav", 1))
+
+    def test_tap_toggle_shows_both(self):
+        cap = vk.normalize(oryx_layout([layer("Main", [key(slot("TT", layer=1))], 0), layer("Num", [], 1)]), "oryx")["layers"][0]["keys"][0]
+        self.assertEqual((cap["tap"], cap["hold"]), ("Num", "toggle"))
 
     def test_modifier_combo(self):
         self.assertEqual(self.main[3]["tap"], "Ctrl+Shift+Tab")
@@ -81,16 +96,50 @@ class Labels(unittest.TestCase):
         self.assertEqual(self.main[8]["tap"], "F12")
         self.assertEqual(self.main[9]["tap"], "Some New Code")
 
-    def test_transparent_shows_base_key(self):
-        self.assertTrue(self.sym[0]["transparent"])
-        self.assertEqual(self.sym[0]["through"], "=")
+    def test_transparent_acts_as_base_key(self):
+        self.assertTrue(self.sym[0]["through"])
+        self.assertEqual((self.sym[0]["tap"], self.sym[0]["hold"]), ("=", "Esc"))
         self.assertNotIn("through", self.sym[1])
+
+    def test_unassigned_keys_fall_through_above_the_base_layer(self):
+        unassigned = {"tap": None, "hold": None}
+        base = layer("Main", [key(slot("KC_A")), unassigned], 0)
+        upper = layer("Upper", [unassigned, key(slot("KC_NO"))], 1)
+        model = vk.normalize(oryx_layout([base, upper]), "oryx")
+        self.assertTrue(model["layers"][0]["keys"][1]["none"])
+        self.assertTrue(model["layers"][1]["keys"][0]["through"])
+        self.assertEqual(model["layers"][1]["keys"][0]["tap"], "A")
+        self.assertTrue(model["layers"][1]["keys"][1]["none"])
+
+    def test_colors(self):
+        self.assertEqual(self.model["layers"][1]["color"], "#0075FF")
+        self.assertEqual(self.main[2]["layerColor"], "#0075FF")
+        self.assertEqual(self.main[0]["glow"], "#6957d2")
+        self.assertEqual(self.main[1]["glow"], "#23CC1D")
+        self.assertIsNone(self.main[3]["glow"])
+        self.assertIsNone(self.main[4]["glow"])
 
     def test_every_layer_has_52_keys(self):
         short = vk.normalize(oryx_layout([{"title": "Only", "position": 0, "keys": [key(slot("KC_A"))]}]), "oryx")
         self.assertEqual(len(short["layers"][0]["keys"]), 52)
         short["layers"][0]["keys"][1]["tap"] = "x"
         self.assertEqual(short["layers"][0]["keys"][2]["tap"], "")
+
+
+class Macros(unittest.TestCase):
+    def test_macro_on_transparent_code_is_a_macro(self):
+        steps = [slot("KC_DOT"), slot("KC_DOT"), slot("KC_DOT"), slot("KC_TRANSPARENT")]
+        base = layer("Main", [key(slot("KC_A"))], 0)
+        sym = layer("Sym", [key(slot("KC_TRANSPARENT", macro={"keys": steps}))], 1)
+        cap = vk.normalize(oryx_layout([base, sym]), "oryx")["layers"][1]["keys"][0]
+        self.assertTrue(cap["macro"])
+        self.assertFalse(cap["transparent"])
+        self.assertEqual(cap["tap"], "...")
+        self.assertEqual(cap["details"], [["Tap", "Types ..."]])
+
+    def test_macro_with_modifiers(self):
+        steps = [slot("KC_C", modifiers={"leftCtrl": True}), slot("KC_V", modifiers={"leftCtrl": True})]
+        self.assertEqual(vk.macro_text({"keys": steps}, None), "Ctrl+C Ctrl+V")
 
 
 class LayoutRef(unittest.TestCase):
@@ -120,19 +169,52 @@ class KeymappCache(unittest.TestCase):
         self.assertEqual((model["revisionId"], model["source"]), ("new", "keymapp"))
 
 
-class Protobuf(unittest.TestCase):
-    def test_decodes_status(self):
-        name = b"Voyager"
-        keyboard = b"\x0a" + bytes([len(name)]) + name + b"\x12\x03v42" + b"\x18\x03"
-        reply = b"\x0a\x051.3.2" + b"\x12" + bytes([len(keyboard)]) + keyboard
-        self.assertEqual(vk.decode_status(reply), ("Voyager", 3))
+class RawHid(unittest.TestCase):
+    def test_matrix_covers_every_key_once(self):
+        self.assertEqual(len(vk.MATRIX), 52)
+        self.assertEqual(len(set(vk.MATRIX)), 52)
 
-    def test_layer_zero_is_omitted_on_the_wire(self):
-        keyboard = b"\x0a\x07Voyager"
-        self.assertEqual(vk.decode_status(b"\x12" + bytes([len(keyboard)]) + keyboard), ("Voyager", 0))
+    def test_key_events_map_to_layout_positions(self):
+        self.assertEqual(vk.parse_report(bytes([6, 1, 0, 0xFE])), {"key": 0, "down": True})
+        self.assertEqual(vk.parse_report(bytes([7, 5, 6, 0xFE])), {"key": 31, "down": False})
+        self.assertEqual(vk.parse_report(bytes([6, 6, 11, 0xFE])), {"key": 51, "down": True})
 
-    def test_no_keyboard(self):
-        self.assertEqual(vk.decode_status(b"\x0a\x051.3.2"), ("", 0))
+    def test_layer_and_unknown_events(self):
+        self.assertEqual(vk.parse_report(bytes([5, 3, 0xFE])), {"layer": 3})
+        self.assertIsNone(vk.parse_report(bytes([6, 0, 0, 0xFE])))
+        self.assertIsNone(vk.parse_report(bytes([4])))
+        self.assertIsNone(vk.parse_report(b""))
+
+    def test_finds_only_the_zsa_raw_hid_interface(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, hid_id, descriptor in (
+                ("hidraw1", "0003:00003297:00001977", bytes([0x05, 0x01, 0x09])),
+                ("hidraw2", "0003:0000046D:0000C52B", bytes([0x06, 0x60, 0xFF])),
+                ("hidraw3", "0003:00003297:00001977", bytes([0x06, 0x60, 0xFF, 0x09])),
+            ):
+                device = root / name / "device"
+                device.mkdir(parents=True)
+                (device / "uevent").write_text(f"DRIVER=hid-generic\nHID_ID={hid_id}\n")
+                (device / "report_descriptor").write_bytes(descriptor)
+            self.assertEqual(vk.find_raw_hid(root), Path("/dev/hidraw3"))
+
+
+class Practice(unittest.TestCase):
+    def test_key_spec_normalizes_and_rejects_injection(self):
+        self.assertEqual(vk.key_spec("super +  shift + k"), "SUPER + SHIFT + K")
+        for bad in ('K") os.execute("rm', "SUPER + K; reboot", "", "SUPER +"):
+            with self.assertRaises(ValueError):
+                vk.key_spec(bad)
+
+    def test_submap_binds_exit_close_move_and_catchall(self):
+        name, lua = vk.practice_submap("SUPER + SHIFT + ALT + K", "SUPER + SHIFT + K", "SUPER + SHIFT + CTRL + K")
+        self.assertTrue(name.startswith("voyager-practice-"))
+        self.assertIn('hl.bind("SUPER + SHIFT + ALT + K", hl.dsp.submap("reset"))', lua)
+        self.assertIn('hl.bind("SUPER + SHIFT + K", hl.dsp.exec_cmd("omarchy-shell shell hide ' + vk.PLUGIN_ID + '"))', lua)
+        self.assertIn('hl.bind("catchall", function() end)', lua)
+        self.assertEqual(name, vk.practice_submap("SUPER + SHIFT + ALT + K", "SUPER + SHIFT + K", "SUPER + SHIFT + CTRL + K")[0])
+        self.assertNotEqual(name, vk.practice_submap("SUPER + P", "SUPER + SHIFT + K", "SUPER + SHIFT + CTRL + K")[0])
 
 
 class OverlaySafety(unittest.TestCase):

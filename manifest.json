@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Mark Omarov",
   "license": "MIT",
-  "description": "Shows your ZSA Voyager layout from Oryx or Keymapp, following the active layer through Keymapp's API.",
+  "description": "A live map of your ZSA Voyager layout: follows the active layer, lights up pressed keys, mirrors LED colors, with a practice mode that keeps keys from reaching apps.",
   "kinds": [
     "overlay"
   ],

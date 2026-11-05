@@ -1,13 +1,22 @@
 {
-  "status.live": "Live: %1",
-  "status.noKeyboard": "Keymapp: no keyboard",
-  "status.noKeymapp": "Keymapp not running",
-  "status.noUv": "uv missing: no live layer",
+  "status.live": "Live",
+  "status.noKeyboard": "Keyboard not connected",
   "status.starting": "Connecting…",
   "status.fetching": "Updating…",
   "footer.source.oryx": "Oryx revision %1",
   "footer.source.keymapp": "Keymapp cache, revision %1",
   "empty.title": "No Voyager layout yet",
-  "empty.body": "Set \"layout\" to your Oryx layout URL in this plugin's entry in ~/.config/omarchy/shell.json, or connect the keyboard with Keymapp running.",
-  "error.fetch": "Could not update: %1"
+  "empty.body": "Set \"layout\" to your Oryx layout URL in this plugin's entry in ~/.config/omarchy/shell.json, or connect the keyboard once with Keymapp.",
+  "error.fetch": "Could not update: %1",
+  "status.readOnly": "Live once Keymapp connects",
+  "status.noAccess": "No access to the keyboard",
+  "practice.off": "Practice",
+  "practice.on": "Practicing",
+  "practice.hint": "Practice: keys stay here and do nothing.\n%1 stops it.",
+  "detail.combo": "Combo",
+  "detail.combos": "Combos on this layer",
+  "detail.hint": "Small text is what holding the key does. Point at or press a key for details.",
+  "key.tapHold": "tap+hold",
+  "key.macro": "macro",
+  "key.combo": "combo"
 }
