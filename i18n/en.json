@@ -1,0 +1,13 @@
+{
+  "status.live": "Live: %1",
+  "status.noKeyboard": "Keymapp: no keyboard",
+  "status.noKeymapp": "Keymapp not running",
+  "status.noUv": "uv missing: no live layer",
+  "status.starting": "Connecting…",
+  "status.fetching": "Updating…",
+  "footer.source.oryx": "Oryx revision %1",
+  "footer.source.keymapp": "Keymapp cache, revision %1",
+  "empty.title": "No Voyager layout yet",
+  "empty.body": "Set \"layout\" to your Oryx layout URL in this plugin's entry in ~/.config/omarchy/shell.json, or connect the keyboard with Keymapp running.",
+  "error.fetch": "Could not update: %1"
+}

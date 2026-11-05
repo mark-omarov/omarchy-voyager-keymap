@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mark-omarov.voyager-keymap",
+  "name": "Voyager Keymap",
+  "version": "0.1.0",
+  "author": "Mark Omarov",
+  "license": "MIT",
+  "description": "Shows your ZSA Voyager layout from Oryx or Keymapp, following the active layer through Keymapp's API.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}

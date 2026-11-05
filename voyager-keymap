@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Feeds the Voyager keymap overlay.
+
+  voyager-keymap fetch [--layout <oryx url or hash>]
+      Writes the layout to $XDG_STATE_HOME/voyager-keymap/layout.json, from Oryx
+      when --layout is given, else from Keymapp's local cache. Prints one JSON
+      status line.
+
+  voyager-keymap watch
+      Prints a JSON line each time Keymapp reports a different keyboard state or
+      active layer. Needs Keymapp running with its API enabled; runs grpcio
+      through uv.
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "voyager-keymap"
+CACHE = STATE_DIR / "layout.json"
+KEYMAPP_DIR = HOME / ".config" / ".keymapp"
+KEYMAPP_DB = KEYMAPP_DIR / "keymapp.sqlite3"
+KEYMAPP_SOCKET = KEYMAPP_DIR / "keymapp.sock"
+ORYX_API = "https://oryx.zsa.io/graphql"
+ORYX_QUERY = (
+    "query getLayout($hashId: String!, $revisionId: String!, $geometry: String) {"
+    " layout(hashId: $hashId, geometry: $geometry, revisionId: $revisionId) {"
+    " hashId title geometry revision { hashId createdAt title"
+    " layers { title position color keys } } } }"
+)
+MAX_LABEL = 24
+KEY_COUNT = 52
+MAX_LAYERS = 32
+
+LABELS = {
+    "KC_MINUS": "-", "KC_MINS": "-", "KC_EQUAL": "=", "KC_EQL": "=",
+    "KC_LBRC": "[", "KC_LEFT_BRACKET": "[", "KC_RBRC": "]", "KC_RIGHT_BRACKET": "]",
+    "KC_BSLS": "\\", "KC_BACKSLASH": "\\", "KC_SCLN": ";", "KC_SEMICOLON": ";",
+    "KC_QUOTE": "'", "KC_QUOT": "'", "KC_GRAVE": "`", "KC_GRV": "`",
+    "KC_COMMA": ",", "KC_COMM": ",", "KC_DOT": ".", "KC_SLASH": "/", "KC_SLSH": "/",
+    "KC_EXLM": "!", "KC_AT": "@", "KC_HASH": "#", "KC_DLR": "$", "KC_PERC": "%",
+    "KC_CIRC": "^", "KC_AMPR": "&", "KC_ASTR": "*", "KC_LPRN": "(", "KC_RPRN": ")",
+    "KC_UNDS": "_", "KC_PLUS": "+", "KC_LCBR": "{", "KC_RCBR": "}", "KC_PIPE": "|",
+    "KC_COLN": ":", "KC_DQUO": "\"", "KC_DQT": "\"", "KC_TILD": "~", "KC_LABK": "<",
+    "KC_LT": "<", "KC_RABK": ">", "KC_GT": ">", "KC_QUES": "?",
+    "KC_NONUS_BACKSLASH": "ISO \\", "KC_NUBS": "ISO \\", "KC_NONUS_HASH": "ISO #",
+    "KC_ENTER": "Enter", "KC_ENT": "Enter", "KC_ESCAPE": "Esc", "KC_ESC": "Esc",
+    "KC_BSPC": "Bksp", "KC_BSPACE": "Bksp", "KC_BACKSPACE": "Bksp", "KC_TAB": "Tab",
+    "KC_SPACE": "Space", "KC_SPC": "Space", "KC_DELETE": "Del", "KC_DEL": "Del",
+    "KC_INSERT": "Ins", "KC_INS": "Ins", "KC_CAPS": "Caps", "KC_CAPSLOCK": "Caps",
+    "KC_CAPS_LOCK": "Caps", "KC_HOME": "Home", "KC_END": "End",
+    "KC_PAGE_UP": "PgUp", "KC_PGUP": "PgUp", "KC_PAGE_DOWN": "PgDn", "KC_PGDN": "PgDn",
+    "KC_LEFT": "←", "KC_RIGHT": "→", "KC_UP": "↑", "KC_DOWN": "↓",
+    "KC_PSCR": "PrtSc", "KC_PRINT_SCREEN": "PrtSc", "KC_PSCREEN": "PrtSc",
+    "KC_SCRL": "ScrLk", "KC_SCROLLLOCK": "ScrLk", "KC_PAUS": "Pause", "KC_PAUSE": "Pause",
+    "KC_APPLICATION": "Menu", "KC_APP": "Menu", "KC_NUM": "NumLk",
+    "KC_LEFT_CTRL": "Ctrl", "KC_LCTL": "Ctrl", "KC_LCTRL": "Ctrl",
+    "KC_RIGHT_CTRL": "Ctrl", "KC_RCTL": "Ctrl", "KC_RCTRL": "Ctrl",
+    "KC_LEFT_SHIFT": "Shift", "KC_LSFT": "Shift", "KC_LSHIFT": "Shift",
+    "KC_RIGHT_SHIFT": "Shift", "KC_RSFT": "Shift", "KC_RSHIFT": "Shift",
+    "KC_LEFT_ALT": "Alt", "KC_LALT": "Alt", "KC_RIGHT_ALT": "AltGr", "KC_RALT": "AltGr",
+    "KC_LEFT_GUI": "Super", "KC_LGUI": "Super", "KC_RIGHT_GUI": "Super", "KC_RGUI": "Super",
+    "KC_AUDIO_MUTE": "Mute", "KC_MUTE": "Mute",
+    "KC_AUDIO_VOL_UP": "Vol +", "KC_VOLU": "Vol +", "KC_AUDIO_VOL_DOWN": "Vol −", "KC_VOLD": "Vol −",
+    "KC_MEDIA_PLAY_PAUSE": "Play", "KC_MPLY": "Play", "KC_MEDIA_NEXT_TRACK": "Next",
+    "KC_MNXT": "Next", "KC_MEDIA_PREV_TRACK": "Prev", "KC_MPRV": "Prev",
+    "KC_MEDIA_STOP": "Stop", "KC_MSTP": "Stop",
+    "KC_BRIGHTNESS_UP": "Bright +", "KC_BRIU": "Bright +",
+    "KC_BRIGHTNESS_DOWN": "Bright −", "KC_BRID": "Bright −",
+    "KC_MS_UP": "Mouse ↑", "KC_MS_DOWN": "Mouse ↓", "KC_MS_LEFT": "Mouse ←", "KC_MS_RIGHT": "Mouse →",
+    "KC_MS_BTN1": "Click", "KC_MS_BTN2": "R-Click", "KC_MS_BTN3": "M-Click",
+    "KC_MS_WH_UP": "Wheel ↑", "KC_MS_WH_DOWN": "Wheel ↓",
+    "KC_MS_WH_LEFT": "Wheel ←", "KC_MS_WH_RIGHT": "Wheel →",
+    "KC_MS_ACCEL0": "Mouse slow", "KC_MS_ACCEL1": "Mouse med", "KC_MS_ACCEL2": "Mouse fast",
+    "CW_TOGG": "Caps Word", "QK_BOOT": "Flash", "QK_LLCK": "Lock layer", "QK_LEAD": "Leader",
+    "KC_LEAD": "Leader", "ALL_T": "Hyper", "HYPR": "Hyper", "MEH_T": "Meh", "MEH": "Meh",
+    "RGB_TOG": "RGB on/off", "RGB_MODE_FORWARD": "RGB mode", "RGB_MOD": "RGB mode",
+    "RGB_VAI": "LED +", "RGB_VAD": "LED −", "RGB_HUI": "Hue +", "RGB_HUD": "Hue −",
+    "RGB_SAI": "Sat +", "RGB_SAD": "Sat −", "RGB_SPI": "Speed +", "RGB_SPD": "Speed −",
+    "RGB_SLD": "RGB static", "RGB": "LED color", "TOGGLE_LAYER_COLOR": "Layer color", "KC_NO": "",
+    "KC_TRANSPARENT": "", "KC_TRNS": "",
+}
+
+LAYER_VERBS = {"MO": "", "LT": "", "TO": "→ ", "TG": "⇄ ", "TT": "⇄ ", "OSL": "1× ", "DF": "Base "}
+
+MODIFIERS = (
+    ("leftCtrl", "Ctrl"), ("rightCtrl", "Ctrl"), ("leftShift", "Shift"), ("rightShift", "Shift"),
+    ("leftAlt", "Alt"), ("rightAlt", "AltGr"), ("leftGui", "Super"), ("rightGui", "Super"),
+)
+
+
+def clip(text):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= MAX_LABEL else text[: MAX_LABEL - 1] + "…"
+
+
+def code_label(code):
+    if code in LABELS:
+        return LABELS[code]
+    match = re.fullmatch(r"KC_([A-Z0-9])", code) or re.fullmatch(r"KC_(F\d{1,2})", code)
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"KC_KP_(\w+)", code)
+    if match:
+        return "Num " + match.group(1).replace("_", " ").title()
+    body = re.sub(r"^(KC|QK|RGB)_", "", code).replace("_", " ").strip()
+    return body.title() if body else code
+
+
+def layer_title(layers, index):
+    if isinstance(index, int) and 0 <= index < len(layers):
+        return (layers[index] or {}).get("title") or f"Layer {index}"
+    return f"Layer {index}"
+
+
+def slot_label(slot, layers):
+    if not isinstance(slot, dict) or not slot.get("code"):
+        return "", None
+    code = str(slot["code"])
+    layer = slot.get("layer")
+    if isinstance(layer, int):
+        return clip(LAYER_VERBS.get(code, code + " ") + layer_title(layers, layer)), layer
+    if slot.get("macro"):
+        return clip(slot.get("description") or "Macro"), None
+    label = code_label(code)
+    modifiers = slot.get("modifiers") or {}
+    held = [name for key, name in MODIFIERS if modifiers.get(key) is True]
+    held = list(dict.fromkeys(held))
+    if held and label:
+        label = "+".join(held + [label])
+    return clip(label), None
+
+
+def normalize(layout, source):
+    revision = layout.get("revision") or {}
+    raw_layers = (revision.get("layers") or [])[:MAX_LAYERS]
+    raw_layers = sorted(raw_layers, key=lambda layer: layer.get("position", 0))
+    layers = []
+    for index, raw in enumerate(raw_layers):
+        keys = []
+        for raw_key in (raw.get("keys") or [])[:KEY_COUNT]:
+            raw_key = raw_key if isinstance(raw_key, dict) else {}
+            tap, tap_layer = slot_label(raw_key.get("tap"), raw_layers)
+            hold, hold_layer = slot_label(raw_key.get("hold"), raw_layers)
+            double, _ = slot_label(raw_key.get("doubleTap"), raw_layers)
+            tap_hold, _ = slot_label(raw_key.get("tapHold"), raw_layers)
+            custom = raw_key.get("customLabel") or raw_key.get("emoji")
+            if isinstance(custom, str) and custom.strip():
+                tap = clip(custom)
+            tap_code = (raw_key.get("tap") or {}).get("code")
+            swatch = (raw_key.get("tap") or {}).get("color") if tap_code == "RGB" else None
+            keys.append({
+                "swatch": swatch if isinstance(swatch, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", swatch) else None,
+                "tap": tap,
+                "hold": hold,
+                "double": double,
+                "tapHold": tap_hold,
+                "layer": tap_layer if tap_layer is not None else hold_layer,
+                "transparent": tap_code in ("KC_TRANSPARENT", "KC_TRNS") and not hold,
+            })
+        keys += [{"swatch": None, "tap": "", "hold": "", "double": "", "tapHold": "", "layer": None, "transparent": False}
+                 for _ in range(KEY_COUNT - len(keys))]
+        color = raw.get("color")
+        layers.append({
+            "title": clip(raw.get("title") or f"Layer {index}"),
+            "color": color if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color) else None,
+            "keys": keys,
+        })
+    base = layers[0]["keys"] if layers else []
+    for layer in layers[1:]:
+        for i, key in enumerate(layer["keys"]):
+            if key["transparent"]:
+                key["through"] = base[i]["tap"]
+    return {
+        "title": clip(layout.get("title") or "Voyager layout"),
+        "layoutId": str(layout.get("hashId") or ""),
+        "revisionId": str(revision.get("hashId") or ""),
+        "revisionAt": str(revision.get("createdAt") or ""),
+        "source": source,
+        "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "layers": layers,
+    }
+
+
+def parse_layout_ref(ref):
+    """Accepts an Oryx URL (configure.zsa.io/voyager/layouts/<id>/<revision>/<layer>) or a bare id."""
+    ref = ref.strip()
+    match = re.search(r"/layouts/([A-Za-z0-9]+)(?:/([A-Za-z0-9]+))?", ref)
+    if match:
+        layout_id, revision = match.group(1), match.group(2) or "latest"
+    elif re.fullmatch(r"[A-Za-z0-9]+", ref):
+        layout_id, revision = ref, "latest"
+    else:
+        raise ValueError(f"not an Oryx layout URL or id: {ref!r}")
+    return layout_id, revision
+
+
+def from_oryx(ref):
+    layout_id, revision = parse_layout_ref(ref)
+    body = json.dumps({
+        "query": ORYX_QUERY,
+        "variables": {"hashId": layout_id, "geometry": "voyager", "revisionId": revision},
+    }).encode()
+    request = urllib.request.Request(ORYX_API, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read(8 * 1024 * 1024))
+    layout = (payload.get("data") or {}).get("layout")
+    if not layout:
+        raise RuntimeError(f"Oryx has no Voyager layout {layout_id}")
+    return normalize(layout, "oryx")
+
+
+def from_keymapp(db_path=KEYMAPP_DB):
+    if not db_path.exists():
+        raise RuntimeError("no layout set and no Keymapp cache yet")
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute("select data from revision").fetchall()
+    layouts = []
+    for (blob,) in rows:
+        layout = (json.loads(blob) or {}).get("layout") or {}
+        if layout.get("geometry") in (None, "voyager"):
+            layouts.append(layout)
+    if not layouts:
+        raise RuntimeError("Keymapp has not cached a Voyager layout yet")
+    newest = max(layouts, key=lambda layout: (layout.get("revision") or {}).get("createdAt") or "")
+    return normalize(newest, "keymapp")
+
+
+def write_cache(model):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(model, ensure_ascii=False))
+    tmp.replace(CACHE)
+
+
+def cmd_fetch(args):
+    try:
+        model = from_oryx(args.layout) if args.layout else from_keymapp()
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError, sqlite3.Error, json.JSONDecodeError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}), flush=True)
+        return 1
+    write_cache(model)
+    print(json.dumps({"ok": True, "source": model["source"], "revisionAt": model["revisionAt"]}), flush=True)
+    return 0
+
+
+def read_varint(data, pos):
+    value = shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def decode_fields(data):
+    fields, pos = {}, 0
+    while pos < len(data):
+        tag, pos = read_varint(data, pos)
+        number, wire = tag >> 3, tag & 7
+        if wire == 0:
+            fields[number], pos = read_varint(data, pos)
+        elif wire == 2:
+            length, pos = read_varint(data, pos)
+            fields[number], pos = data[pos:pos + length], pos + length
+        elif wire == 5:
+            fields[number], pos = data[pos:pos + 4], pos + 4
+        elif wire == 1:
+            fields[number], pos = data[pos:pos + 8], pos + 8
+        else:
+            raise ValueError(f"unsupported wire type {wire}")
+    return fields
+
+
+def decode_status(reply):
+    keyboard = decode_fields(decode_fields(reply).get(2, b""))
+    return keyboard.get(1, b"").decode(errors="replace"), int(keyboard.get(3, 0))
+
+
+def cmd_watch(_args):
+    if os.environ.get("VOYAGER_KEYMAP_IN_UV") != "1":
+        os.environ["VOYAGER_KEYMAP_IN_UV"] = "1"
+        try:
+            os.execvp("uv", ["uv", "run", "--quiet", "--no-project", "--with", "grpcio==1.85.1",
+                             "python3", os.path.abspath(__file__), "watch"])
+        except OSError:
+            print(json.dumps({"state": "no-uv"}), flush=True)
+            return 1
+    import grpc
+
+    def emit(state, layer=None, keyboard=""):
+        print(json.dumps({"state": state, "layer": layer, "keyboard": keyboard}), flush=True)
+
+    last = None
+    channel = None
+    while True:
+        try:
+            if not KEYMAPP_SOCKET.exists():
+                current = ("no-keymapp", None, "")
+            else:
+                if channel is None:
+                    channel = grpc.insecure_channel(f"unix://{KEYMAPP_SOCKET}")
+                identity = lambda value: value
+                status = channel.unary_unary("/api.KeyboardService/GetStatus",
+                                             request_serializer=lambda _: b"", response_deserializer=identity)
+                name, layer = decode_status(status(None, timeout=1.0))
+                if name:
+                    current = ("connected", layer, name)
+                else:
+                    connect = channel.unary_unary("/api.KeyboardService/ConnectAnyKeyboard",
+                                                  request_serializer=lambda _: b"", response_deserializer=identity)
+                    try:
+                        connect(None, timeout=1.0)
+                    except grpc.RpcError:
+                        pass
+                    current = ("no-keyboard", None, "")
+        except grpc.RpcError:
+            if channel is not None:
+                channel.close()
+            channel = None
+            current = ("no-keymapp", None, "")
+        if current != last:
+            emit(*current)
+            last = current
+        time.sleep(0.1 if current[0] == "connected" else 1.0)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="voyager-keymap")
+    sub = parser.add_subparsers(dest="command", required=True)
+    fetch = sub.add_parser("fetch")
+    fetch.add_argument("--layout", default="")
+    sub.add_parser("watch")
+    args = parser.parse_args()
+    return {"fetch": cmd_fetch, "watch": cmd_watch}[args.command](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
