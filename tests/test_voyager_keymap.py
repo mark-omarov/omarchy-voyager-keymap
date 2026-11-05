@@ -64,6 +64,10 @@ class Labels(unittest.TestCase):
         self.assertEqual((self.main[1]["tap"], self.main[1]["hold"]), ("A", "Shift"))
         self.assertEqual(self.main[1]["kind"], "multi")
 
+    def test_layer_details_read_naturally(self):
+        self.assertIn(["Hold", "Sym layer"], self.main[2]["details"])
+        self.assertIn(["Tap", "Toggle Sym"], self.main[4]["details"])
+
     def test_layer_keys_use_layer_names(self):
         self.assertEqual((self.main[2]["hold"], self.main[2]["layer"]), ("Sym", 1))
         self.assertEqual(self.main[4]["tap"], "toggle Sym")

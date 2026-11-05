@@ -113,7 +113,7 @@ MODIFIER_CODES = {
     "KC_RIGHT_GUI", "KC_RGUI", "HYPR", "MEH", "OSM",
 }
 LAYER_ACTIONS = {
-    "MO": "Hold for", "LT": "Hold for", "LM": "Hold for", "TO": "Switch to", "TG": "Toggle",
+    "MO": "", "LT": "", "LM": "", "TO": "Switch to", "TG": "Toggle",
     "TT": "Hold for, tap to toggle", "OSL": "Next key on", "DF": "Make base",
 }
 
@@ -194,7 +194,9 @@ def slot_text(slot, layers, catalog=None):
         held = held_modifiers(slot.get("modifier") or slot.get("modifiers"))
         extra = " with " + "+".join(held) if held else ""
         label = LAYER_VERBS.get(code, code + " ") + title
-        return clip(label), layer, clip(f"{LAYER_ACTIONS.get(code, code)} {title}{extra}", MAX_DETAIL)
+        action = LAYER_ACTIONS.get(code, code)
+        detail = f"{action} {title}" if action else f"{title} layer"
+        return clip(label), layer, clip(detail + extra, MAX_DETAIL)
     if code == "OSM":
         held = held_modifiers(slot.get("modifier") or slot.get("modifiers"))
         name = "+".join(held) or "modifier"
